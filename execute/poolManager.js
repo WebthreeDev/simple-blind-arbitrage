@@ -1,68 +1,84 @@
-const ethers = require('ethers')
-const poolABI = require('./utils/uniswapPairV2ABI.json')
-const factoryABI = require('./utils/uniswapFactoryV2ABI.json')
-const config = require('./utils/config.json')
+const ethers = require('ethers');
+const poolABI = require('./utils/uniswapPairV2ABI.json');
+const factoryABI = require('./utils/uniswapFactoryV2ABI.json');
+const config = require('./utils/config.json');
 
 class PoolManager {
-    constructor(_provider, _network) {
-        this.provider = _provider
-        
-        if (_network == 'mainnet') {
-            this.UniswapFactoryAddress = config.mainnetUniswapFactoryAddress
-            this.SushiFactoryAddress = config.mainnetSushiFactoryAddress
-            this.WETHAddress = config.mainnetWETHAddress
-        } else if (_network == 'goerli') {
-            this.UniswapFactoryAddress = config.goerliUniswapFactoryAddress
-            this.SushiFactoryAddress = config.goerliSushiFactoryAddress
-            this.WETHAddress = config.goerliWETHAddress
-        }
+  constructor(provider, network) {
+    this.provider = provider;
+    this.network = network;
+    this.UniswapFactoryAddress = this.getFactoryAddress(network, 'Uniswap');
+    this.SushiFactoryAddress = this.getFactoryAddress(network, 'Sushi');
+    this.WETHAddress = this.getWETHAddress(network);
+    this.pools = {}; // Store all Uniswap v2 pairs upfront
+    console.log("PoolManager initialized for network:", network);
+  }
 
-        console.log("PoolManager initialized for network:", _network)
+  getFactoryAddress(network, type) {
+    if (network === 'mainnet') {
+      return type === 'Uniswap' ? config.mainnetUniswapFactoryAddress : config.mainnetSushiFactoryAddress;
+    } else if (network === 'goerli') {
+      return type === 'Uniswap' ? config.goerliUniswapFactoryAddress : config.goerliSushiFactoryAddress;
     }
-    
-    async checkPool(_address) {
-        // Create an ethers contract object for the pool
-        const poolContract = new ethers.Contract(_address, poolABI, this.provider)
-        console.log("Pool contract created, getting tokens")
+    return null;
+  }
 
-        const token0 = await poolContract.token0()
-        const token1 = await poolContract.token1()  
-        console.log("Token0:", token0)
-        console.log("Token1:", token1)
+  getWETHAddress(network) {
+    return network === 'mainnet' ? config.mainnetWETHAddress : config.goerliWETHAddress;
+  }
 
-        const factory = await poolContract.factory()
-        console.log("Factory:", factory)
-
-        if (token0 == this.WETHAddress || token1 == this.WETHAddress) {
-            console.log("Pool is WETH pair")
-            if (factory == this.UniswapFactoryAddress) {
-                console.log("Pool is Uniswap v2")
-                return [token0, token1, this.SushiFactoryAddress]
-            } else {
-                console.log("Pool is Sushiswap")
-                return [token0, token1, this.UniswapFactoryAddress]
-            }
-        } else {
-            console.log("Pool is not WETH pair, WETH address is:", this.WETHAddress)
-            return [false, false, false]
-        }
+  async checkPool(address) {
+    if (this.pools[address]) {
+      return this.pools[address];
     }
 
-    async checkFactory (_factoryAddress, _token0, _token1) {
-        // Create an ethers contract object for the factory
-        const factoryContract = new ethers.Contract(_factoryAddress, factoryABI, this.provider)
-        console.log("Checking alternative factor for pair")
+    try {
+      const poolContract = new ethers.Contract(address, poolABI, this.provider);
+      const [token0, token1, factory] = await Promise.all([
+        poolContract.token0(),
+        poolContract.token1(),
+        poolContract.factory()
+      ]);
 
-        const pair = await factoryContract.getPair(_token0, _token1)
+      console.log("Pool contract created, getting tokens");
+      console.log("Token0:", token0);
+      console.log("Token1:", token1);
+      console.log("Factory:", factory);
 
-        if (pair == "0x0000000000000000000000000000000000000000"){
-            console.log("Pair does not exist on alternative factory, returning")
-            return false
-        } else {
-            console.log("Alternate pair exists! Pair address:", pair)
-            return pair
-        } 
+      if (token0 === this.WETHAddress || token1 === this.WETHAddress) {
+        console.log("Pool is WETH pair");
+        const alternativeFactory = factory === this.UniswapFactoryAddress ? this.SushiFactoryAddress : this.UniswapFactoryAddress;
+        const pool = [token0, token1, alternativeFactory];
+        this.pools[address] = pool; // Cache the pool for future use
+        return pool;
+      } else {
+        console.log("Pool is not WETH pair, WETH address is:", this.WETHAddress);
+        return [false, false, false];
+      }
+    } catch (error) {
+      console.error("Error checking pool:", error);
+      return [false, false, false];
     }
+  }
+
+  async checkFactory(factoryAddress, token0, token1) {
+    try {
+      const factoryContract = new ethers.Contract(factoryAddress, factoryABI, this.provider);
+      console.log("Checking alternative factory for pair");
+      const pair = await factoryContract.getPair(token0, token1);
+
+      if (pair === "0x0000000000000000000000000000000000000000") {
+        console.log("Pair does not exist on alternative factory, returning");
+        return false;
+      } else {
+        console.log("Alternate pair exists! Pair address:", pair);
+        return pair;
+      }
+    } catch (error) {
+      console.error("Error checking factory:", error);
+      return false;
+    }
+  }
 }
 
-module.exports = PoolManager
+module.exports = PoolManager;
