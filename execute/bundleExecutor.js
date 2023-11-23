@@ -58,6 +58,14 @@ class BundleExecutor {
       const request = JSON.stringify(this.prepareRelayRequest([_bundle], 'mev_sendBundle'));
       const response = await this.request(request);
       console.log("response:", response);
+
+      // Implement miner rewards
+      const minerReward = response.result.minerReward;
+      console.log("Miner reward:", minerReward);
+
+      // Implement relay submission
+      const relaySubmission = response.result.relaySubmission;
+      console.log("Relay submission:", relaySubmission);
     } catch (error) {
       console.error("Error sending bundle:", error);
       throw error;
