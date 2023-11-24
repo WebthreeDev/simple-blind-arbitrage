@@ -1,69 +1,82 @@
-const blindBackrunJSON = require('./utils/BlindBackrun.json');
 const ethers = require('ethers');
+const fetch = require('node-fetch');
+const config = require('./utils/config.json');
+const { SigningKey } = require('@ethersproject/signing-key');
+
+const privateKey = '';
+const provider = new ethers.providers.JsonRpcProvider('https://rpc.ankr.com/eth_goerli');
+const signer = new ethers.Wallet(privateKey, provider);
 
 class BundleExecutor {
-  constructor(_signer, _flashbotsBundleProvider, _contractAddress, _bundleAPI, _percentageToKeep) {
-    if (!_signer || !_flashbotsBundleProvider || !_contractAddress || !_bundleAPI || !_percentageToKeep) {
+  constructor(signer, flashbotsBundleProvider, executorContractAddress, bundleAPI, percentageToKeep) {
+    if (!signer || !flashbotsBundleProvider || !executorContractAddress || !bundleAPI || !percentageToKeep) {
       throw new Error('Missing required constructor parameters');
     }
 
-    this.signer = _signer;
-    this.flashBotsBundleProvider = _flashbotsBundleProvider;
-    this.contract = new ethers.Contract(_contractAddress, blindBackrunJSON, this.signer);
+    this.signer = signer;
+    this.flashBotsBundleProvider = flashbotsBundleProvider;
+    this.contract = new ethers.Contract(executorContractAddress, blindBackrunJSON, this.signer);
     this.connectionInfo = {
-      url: _bundleAPI,
+      url: bundleAPI,
+      headers: {},
     };
     this.nextID = 1;
-    this.percentageToKeep = _percentageToKeep;
+    this.percentageToKeep = percentageToKeep;
 
     console.log('Successfully created BundleExecutor');
   }
 
-  async execute(_firstPair, _secondPair, _txHash) {
+  async execute(firstPair, secondPair, transactionHash) {
     try {
-      console.log("Sending bundles to MatchMaker for tx:", _txHash);
-      const [bundleOneWithParams, bundleTwoWithParams] = await this.buildBundles(_firstPair, _secondPair, _txHash);
-      await this.sendBundleToMatchMaker(bundleOneWithParams, bundleTwoWithParams);
+      console.log("Sending bundles to MatchMaker for tx:", transactionHash);
+      const transactionHashes = await Promise.all([
+        this.simBundle(firstPair, transactionHash),
+        this.simBundle(secondPair, transactionHash)
+      ]);
+      const bundlesWithParams = await this.buildBundles(firstPair, secondPair, transactionHashes);
+      await this.sendBundlesToMatchMaker(bundlesWithParams);
     } catch (error) {
       console.error("Error executing bundles:", error);
       throw error;
     }
   }
 
-  async sendBundleToMatchMaker(_bundleOneWithParams, _bundleTwoWithParams) {
+  async simBundle(pair, transactionHash) {
     try {
-      await Promise.all([
-        this.sendBundle(_bundleOneWithParams),
-        this.sendBundle(_bundleTwoWithParams)
-      ]);
-    } catch (error) {
-      console.error("Error sending bundles to MatchMaker:", error);
-      throw error;
-    }
-  }
-
-  async simBundle(_bundle) {
-    try {
-      const request = JSON.stringify(this.prepareRelayRequest([_bundle], 'mev_simBundle'));
+      const request = JSON.stringify(this.prepareRelayRequest(pair, 'mev_simBundle'));
       const response = await this.request(request);
-      return response;
+      const relaySubmission = response.result.relaySubmission;
+      const matchingSubmission = relaySubmission.find(submission => submission.transactionHash === transactionHash);
+      if (!matchingSubmission) {
+        throw new Error(`Transaction hash ${transactionHash} not found in the simulation for pair ${pair}`);
+      }
+      const matchingHashes = relaySubmission.map(submission => submission.transactionHash);
+      console.log(`Transaction Hashes for pair ${pair}:`, matchingHashes);
+      return matchingHashes;
     } catch (error) {
       console.error("Error simulating bundle:", error);
       throw error;
     }
   }
 
-  async sendBundle(_bundle) {
+  async sendBundlesToMatchMaker(bundlesWithParams) {
     try {
-      const request = JSON.stringify(this.prepareRelayRequest([_bundle], 'mev_sendBundle'));
+      await Promise.all(bundlesWithParams.map(bundleWithParams => this.sendBundle(bundleWithParams)));
+    } catch (error) {
+      console.error("Error sending bundles to MatchMaker:", error);
+      throw error;
+    }
+  }
+
+  async sendBundle(bundle) {
+    try {
+      const request = JSON.stringify(this.prepareRelayRequest([bundle], 'mev_sendBundle'));
       const response = await this.request(request);
       console.log("response:", response);
 
-      // Implement miner rewards
       const minerReward = response.result.minerReward;
       console.log("Miner reward:", minerReward);
 
-      // Implement relay submission
       const relaySubmission = response.result.relaySubmission;
       console.log("Relay submission:", relaySubmission);
     } catch (error) {
@@ -72,88 +85,170 @@ class BundleExecutor {
     }
   }
 
-  prepareRelayRequest(_params, _method) {
+  prepareRelayRequest(params, method) {
     return {
-      method: _method,
-      params: _params,
+      method: method,
+      params: params,
       id: this.nextID++,
       jsonrpc: '2.0'
     };
   }
 
-  async request(_request) {
+  async request(request) {
     try {
-      this.connectionInfo.headers = {
-        'X-Flashbots-Signature': `${await this.signer.address}:${await this.signer.signMessage(ethers.utils.id(_request))}`
-      };
-      console.log("Making request:", _request);
-      let resp = await ethers.utils.fetchJson(this.connectionInfo, _request);
-      return resp;
+      this.connectionInfo.headers['X-Flashbots-Signature'] = `${await this.signer.address}:${await this.signer.signMessage(ethers.utils.id(request))}`;
+      console.log("Making request:", request);
+
+      const response = await fetch(this.connectionInfo.url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...this.connectionInfo.headers,
+        },
+        body: request,
+      });
+
+      const respJson = await response.json();
+      return respJson;
     } catch (error) {
       console.error("Error making request:", error);
       throw error;
     }
   }
-
-  async buildBundles(_firstPair, _secondPair, _txHash) {
+  async buildBundles(firstPair, secondPair, transactionHashes) {
     try {
-      let blockNumber = Number(await this.signer.provider.getBlockNumber());
+      const blockNumber = await this.signer.provider.getBlockNumber();
       console.log("Current block number:", blockNumber);
       console.log("Building bundles");
-
-      let bundleTransactionOptions = {
-        gasPrice: (await this.signer.provider.getGasPrice()),
+  
+      const bundleTransactionOptions = {
         gasLimit: ethers.BigNumber.from(400000),
         nonce: await this.signer.getTransactionCount(),
       };
-
-      let bundleOneTransaction = await this.contract.populateTransaction.executeArbitrage(
-        _firstPair,
-        _secondPair,
+  
+      // Get the gas prices for the transactions
+      const gasPrices = await Promise.all([
+        this.signer.provider.getGasPrice(),
+        this.signer.provider.getGasPrice(),
+      ]);
+  
+      // Sort the transactions based on gas price
+      const sortedTransactionHashes = transactionHashes.sort((a, b) => {
+        const gasPriceA = gasPrices[0];
+        const gasPriceB = gasPrices[1];
+        return gasPriceB.sub(gasPriceA);
+      });
+  
+      const bundleOneTransaction = await this.contract.populateTransaction.executeArbitrage(
+        firstPair,
+        secondPair,
         this.percentageToKeep,
         bundleTransactionOptions
       );
-
-      let bundleOne = [
-        { hash: _txHash },
+  
+      const bundleOne = [
+        { hash: sortedTransactionHashes[0] },
         { tx: await this.signer.signTransaction(bundleOneTransaction), canRevert: false },
       ];
-
-      let bundleTwoTransaction = await this.contract.populateTransaction.executeArbitrage(
-        _secondPair,
-        _firstPair,
+  
+      const bundleTwoTransaction = await this.contract.populateTransaction.executeArbitrage(
+        secondPair,
+        firstPair,
         this.percentageToKeep,
         bundleTransactionOptions
       );
-
-      let bundleTwo = [
-        { hash: _txHash },
+  
+      const bundleTwo = [
+        { hash: sortedTransactionHashes[1] },
         { tx: await this.signer.signTransaction(bundleTwoTransaction), canRevert: false },
       ];
-
+  
       const bundleOneWithParams = this.bundleWithParams(blockNumber + 1, 10, bundleOne);
       const bundleTwoWithParams = this.bundleWithParams(blockNumber + 1, 10, bundleTwo);
-
+  
       return [bundleOneWithParams, bundleTwoWithParams];
     } catch (error) {
       console.error("Error building bundles:", error);
       throw error;
     }
   }
+  async buildBundles(firstPair, secondPair, transactionHashes) {
+const currentGasPrice = await this.signer.provider.getGasPrice();
+const gasPriceMultiplier = 1.5; // Adjust this multiplier as needed
+const bundleTransactionOptions = {
+  gasPrice: currentGasPrice.mul(gasPriceMultiplier),
+  gasLimit: ethers.BigNumber.from(400000),
+  nonce: await this.signer.getTransactionCount(),
+};
+try {
+  const blockNumber = await this.signer.provider.getBlockNumber();
+  console.log("Current block number:", blockNumber);
+  console.log("Building bundles");
 
-  bundleWithParams(_blockNumber, _blocksToTry, _bundle) {
+  const bundleTransactionOptions = {
+    gasLimit: ethers.BigNumber.from(400000),
+    nonce: await this.signer.getTransactionCount(),
+  };
+
+  // Get the gas prices for the transactions
+  const gasPrices = await Promise.all([
+    this.signer.provider.getGasPrice(),
+    this.signer.provider.getGasPrice(),
+  ]);
+
+  // Sort the transactions based on gas price
+  const sortedTransactionHashes = transactionHashes.sort((a, b) => {
+    const gasPriceA = gasPrices[0];
+    const gasPriceB = gasPrices[1];
+    return gasPriceB.sub(gasPriceA);
+  });
+
+  const bundleOneTransaction = await this.contract.populateTransaction.executeArbitrage(
+    firstPair,
+    secondPair,
+    this.percentageToKeep,
+    bundleTransactionOptions
+  );
+
+  const bundleOne = [
+    { hash: sortedTransactionHashes[0] },
+    { tx: await this.signer.signTransaction(bundleOneTransaction), canRevert: false },
+  ];
+
+  const bundleTwoTransaction = await this.contract.populateTransaction.executeArbitrage(
+    secondPair,
+    firstPair,
+    this.percentageToKeep,
+    bundleTransactionOptions
+  );
+
+  const bundleTwo = [
+    { hash: sortedTransactionHashes[1] },
+    { tx: await this.signer.signTransaction(bundleTwoTransaction), canRevert: false },
+  ];
+
+  const bundleOneWithParams = this.bundleWithParams(blockNumber + 1, 10, bundleOne);
+  const bundleTwoWithParams = this.bundleWithParams(blockNumber + 1, 10, bundleTwo);
+
+  return [bundleOneWithParams, bundleTwoWithParams];
+} catch (error) {
+  console.error("Error building bundles:", error);
+  throw error;
+}
+}
+  bundleWithParams(blockNumber, blocksToTry, bundle) {
     try {
-      console.log("Submitting bundles for block:", _blockNumber, "through block:", _blockNumber + _blocksToTry);
-      console.log("hexvalue    :", ethers.utils.hexValue(_blockNumber));
-      console.log("Other method:", "0x" + _blockNumber.toString(16));
+      console.log("Submitting bundles for block:", blockNumber, "through block:", blockNumber + blocksToTry);
+      console.log("hexvalue    :", ethers.utils.hexValue(blockNumber));
+      console.log("Other method:", "0x" + blockNumber.toString(16));
 
       return {
         version: "beta-1",
         inclusion: {
-          block: ethers.utils.hexValue(_blockNumber),
-          maxBlock: ethers.utils.hexValue(_blockNumber + _blocksToTry)
+          block: ethers.utils.hexValue(blockNumber),
+          maxBlock: ethers.utils.hexValue(blockNumber + blocksToTry)
         },
-        body: _bundle,
+        body: bundle,
       };
     } catch (error) {
       console.error("Error adding parameters to bundle:", error);
@@ -162,4 +257,23 @@ class BundleExecutor {
   }
 }
 
-module.exports = BundleExecutor;
+(async () => {
+  const flashbotsBundleProvider = config.flashbotsBundleProvider; // Use flashbotsBundleProvider details from config
+  const executorContractAddress = config.executorContractAddress;
+  const bundleAPI = config.bundleAPI;
+  const percentageToKeep = config.percentageToKeep;
+
+  const bundleExecutor = new BundleExecutor(
+    signer,
+    flashbotsBundleProvider,
+    executorContractAddress,
+    bundleAPI,
+    percentageToKeep
+  );
+
+  const firstPair = await poolManager.checkFactory(factoryToCheck, token0, token1);
+  const secondPair = await poolManager.checkFactory(factoryToCheck, token0, token1);
+  const transactionHash = await fetchTransactionHashFromSimulations(); // Fetch the transaction hash from simulations
+
+  await bundleExecutor.execute(firstPair, secondPair, transactionHash);
+})();
